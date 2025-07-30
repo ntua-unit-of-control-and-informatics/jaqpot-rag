@@ -3,7 +3,8 @@ uvicorn[standard]==0.24.0
 langchain==0.1.0
 langchain-community==0.0.13
 pinecone-client==3.0.0
-sentence-transformers==2.2.2
+sentence-transformers==2.7.0
+huggingface_hub==0.20.3
 beautifulsoup4==4.12.2
 requests==2.31.0
 python-dotenv==1.0.0
@@ -11,3 +12,5 @@ pydantic==2.5.0
 httpx==0.25.2
 lxml==4.9.3
 aiofiles==23.2.1
+selenium==4.15.0
+webdriver-manager==4.0.1

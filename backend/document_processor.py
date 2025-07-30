@@ -9,6 +9,15 @@ import logging
 from dataclasses import dataclass
 import re
 
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -20,21 +29,46 @@ class Document:
     metadata: Dict = None
 
 class JaqpotDocsScraper:
-    """Scraper for Jaqpot documentation"""
+    """Scraper for Jaqpot documentation using Selenium for JavaScript-rendered content"""
     
-    def __init__(self, base_url: str = "https://jaqpot.org/docs", data_dir: str = "../data/jaqpot_docs"):
+    def __init__(self, base_url: str = "https://jaqpot.org/docs", data_dir: str = None):
         self.base_url = base_url
-        self.data_dir = data_dir
+        if data_dir is None:
+            self.data_dir = "./data/jaqpot_docs" if os.path.exists("./data") else "../data/jaqpot_docs"
+        else:
+            self.data_dir = data_dir
         self.visited_urls: Set[str] = set()
         self.documents: List[Document] = []
+        self.driver = None
         
         # Create data directory
-        os.makedirs(data_dir, exist_ok=True)
+        os.makedirs(self.data_dir, exist_ok=True)
         
-        # Headers to avoid blocking
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
+        # Initialize Selenium WebDriver
+        self._init_driver()
+    
+    def _init_driver(self):
+        """Initialize Chrome WebDriver with appropriate options"""
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")  # Run in background
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--window-size=1920,1080")
+        chrome_options.add_argument("--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+        
+        try:
+            service = Service(ChromeDriverManager().install())
+            self.driver = webdriver.Chrome(service=service, options=chrome_options)
+            logger.info("Chrome WebDriver initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize Chrome WebDriver: {e}")
+            raise e
+    
+    def __del__(self):
+        """Clean up WebDriver on destruction"""
+        if self.driver:
+            self.driver.quit()
     
     def is_valid_jaqpot_url(self, url: str) -> bool:
         """Check if URL is a valid Jaqpot docs URL"""
@@ -45,74 +79,111 @@ class JaqpotDocsScraper:
             url not in self.visited_urls
         )
     
+    def get_next_page_url(self, current_url: str) -> str:
+        """Extract the 'Next' button URL using Selenium to wait for JavaScript to load"""
+        logger.debug(f"Looking for next page from: {current_url}")
+        
+        try:
+            # Load the page
+            self.driver.get(current_url)
+            
+            # Wait for the page to load and for navigation elements to appear
+            wait = WebDriverWait(self.driver, 10)
+            
+            # Try multiple selectors for the next button
+            next_selectors = [
+                "a.pagination-nav__link.pagination-nav__link--next",
+                "a[class*='pagination-nav__link--next']",
+                "a[class*='next']",
+                ".pagination-nav__link--next"
+            ]
+            
+            for selector in next_selectors:
+                try:
+                    # Wait for the element to be present and clickable
+                    next_element = wait.until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                    )
+                    
+                    href = next_element.get_attribute('href')
+                    logger.debug(f"Found next link with selector '{selector}': {href}")
+                    
+                    if href and self.is_valid_jaqpot_url(href):
+                        return href
+                        
+                except TimeoutException:
+                    logger.debug(f"Timeout waiting for selector: {selector}")
+                    continue
+                except Exception as e:
+                    logger.debug(f"Error with selector '{selector}': {e}")
+                    continue
+            
+            # If specific selectors don't work, try finding by text content
+            try:
+                next_elements = self.driver.find_elements(By.XPATH, "//a[contains(text(), 'Next') or contains(@class, 'next')]")
+                for element in next_elements:
+                    href = element.get_attribute('href')
+                    if href and self.is_valid_jaqpot_url(href):
+                        logger.debug(f"Found next link by text search: {href}")
+                        return href
+            except Exception as e:
+                logger.debug(f"Error searching by text: {e}")
+            
+            logger.debug("No next page link found")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting next page URL from {current_url}: {e}")
+            return None
+
     def extract_content(self, soup: BeautifulSoup, url: str) -> List[Document]:
-        """Extract content from a documentation page"""
+        """Extract content from a Docusaurus documentation page"""
         documents = []
         
-        # Get page title
+        # Get page title from h1 or title tag
         title_elem = soup.find('h1') or soup.find('title')
         page_title = title_elem.get_text().strip() if title_elem else "Untitled"
         
-        # Remove navigation, header, footer elements
-        for elem in soup.find_all(['nav', 'header', 'footer', 'aside']):
-            elem.decompose()
-        
-        # Find main content area
+        # For Docusaurus, look for the main content area
         main_content = (
+            soup.find('article') or
             soup.find('main') or 
-            soup.find('article') or 
-            soup.find('div', class_=re.compile(r'content|main|docs')) or
-            soup.find('body')
+            soup.find('div', class_=re.compile(r'docPage|content|main')) or
+            soup.find('div', {'role': 'main'})
         )
         
         if not main_content:
             logger.warning(f"No main content found for {url}")
             return documents
         
-        # Extract sections
-        sections = main_content.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+        # Remove code blocks temporarily to avoid splitting them
+        code_blocks = []
+        for code in main_content.find_all(['pre', 'code']):
+            placeholder = f"__CODE_BLOCK_{len(code_blocks)}__"
+            code_blocks.append(code.get_text())
+            code.replace_with(placeholder)
         
-        if not sections:
-            # If no sections, treat entire content as one document
-            content = self.clean_text(main_content.get_text())
-            if content.strip():
-                documents.append(Document(
-                    title=page_title,
-                    content=content,
-                    url=url,
-                    section="main",
-                    metadata={"page_title": page_title}
-                ))
-        else:
-            # Extract content by sections
-            for i, section in enumerate(sections):
-                section_title = section.get_text().strip()
-                
-                # Get content until next section
-                content_parts = []
-                current = section.next_sibling
-                
-                while current and not (current.name and current.name.lower() in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
-                    if hasattr(current, 'get_text'):
-                        text = current.get_text().strip()
-                        if text:
-                            content_parts.append(text)
-                    current = current.next_sibling
-                
-                content = self.clean_text(' '.join(content_parts))
-                
-                if content.strip():
-                    documents.append(Document(
-                        title=f"{page_title} - {section_title}",
-                        content=content,
-                        url=url,
-                        section=section_title,
-                        metadata={
-                            "page_title": page_title,
-                            "section_title": section_title,
-                            "section_level": section.name
-                        }
-                    ))
+        # Get all text content
+        full_content = main_content.get_text()
+        
+        # Restore code blocks
+        for i, code_text in enumerate(code_blocks):
+            full_content = full_content.replace(f"__CODE_BLOCK_{i}__", code_text)
+        
+        # Clean the content
+        content = self.clean_text(full_content)
+        
+        if content.strip():
+            documents.append(Document(
+                title=page_title,
+                content=content,
+                url=url,
+                section="main",
+                metadata={
+                    "page_title": page_title,
+                    "content_length": len(content)
+                }
+            ))
         
         return documents
     
@@ -125,16 +196,11 @@ class JaqpotDocsScraper:
         return text.strip()
     
     def get_links(self, soup: BeautifulSoup, current_url: str) -> List[str]:
-        """Extract all valid documentation links from a page"""
+        """Extract next page link from Docusaurus navigation"""
         links = []
-        
-        for link in soup.find_all('a', href=True):
-            href = link['href']
-            absolute_url = urljoin(current_url, href)
-            
-            if self.is_valid_jaqpot_url(absolute_url):
-                links.append(absolute_url)
-        
+        next_url = self.get_next_page_url(soup, current_url)
+        if next_url:
+            links.append(next_url)
         return links
     
     def scrape_page(self, url: str) -> List[Document]:
@@ -164,34 +230,128 @@ class JaqpotDocsScraper:
             logger.error(f"Error scraping {url}: {e}")
             return [], []
     
-    def scrape_all(self, max_pages: int = 50) -> List[Document]:
-        """Scrape all Jaqpot documentation"""
-        logger.info("Starting Jaqpot documentation scraping...")
+    def get_all_sidebar_links(self, url: str) -> List[str]:
+        """Get all documentation links from sidebar navigation using Selenium"""
+        links = set()
         
-        urls_to_visit = [self.base_url]
+        try:
+            # Load the page with Selenium
+            self.driver.get(url)
+            
+            # Wait for sidebar to load
+            wait = WebDriverWait(self.driver, 10)
+            
+            # Find Docusaurus sidebar
+            sidebar_selectors = [
+                'nav[class*="sidebar"]',
+                'aside[class*="sidebar"]', 
+                'div[class*="sidebar"]',
+                'nav[class*="menu"]',
+                'ul[class*="menu"]',
+                '.menu',
+                '.sidebar'
+            ]
+            
+            sidebar_element = None
+            for selector in sidebar_selectors:
+                try:
+                    sidebar_element = wait.until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                    )
+                    logger.debug(f"Found sidebar with selector: {selector}")
+                    break
+                except TimeoutException:
+                    continue
+            
+            if sidebar_element:
+                # Get all links from sidebar
+                link_elements = sidebar_element.find_elements(By.TAG_NAME, "a")
+                
+                for link_element in link_elements:
+                    href = link_element.get_attribute('href')
+                    if href:
+                        if href.startswith('/docs'):
+                            full_url = urljoin('https://jaqpot.org', href)
+                            links.add(full_url)
+                            logger.debug(f"Found sidebar link: {full_url}")
+                        elif href.startswith('https://jaqpot.org/docs'):
+                            links.add(href)
+                            logger.debug(f"Found sidebar link: {href}")
+            
+        except Exception as e:
+            logger.error(f"Error getting sidebar links: {e}")
+        
+        return list(links)
+
+    def scrape_all(self, max_pages: int = 50) -> List[Document]:
+        """Scrape all Jaqpot documentation following Next button navigation with Selenium"""
+        logger.info("Starting Jaqpot documentation scraping using Selenium and Next button navigation...")
+        
         all_documents = []
+        current_url = self.base_url
         pages_scraped = 0
         
-        while urls_to_visit and pages_scraped < max_pages:
-            current_url = urls_to_visit.pop(0)
-            
+        while current_url and pages_scraped < max_pages:
             if current_url in self.visited_urls:
-                continue
+                logger.info(f"Already visited {current_url}, stopping to avoid loop")
+                break
             
-            documents, new_links = self.scrape_page(current_url)
-            all_documents.extend(documents)
+            logger.info(f"Scraping page {pages_scraped + 1}: {current_url}")
             
-            # Add new links to queue
-            for link in new_links:
-                if link not in self.visited_urls and link not in urls_to_visit:
-                    urls_to_visit.append(link)
-            
-            pages_scraped += 1
-            
-            if pages_scraped % 5 == 0:
-                logger.info(f"Scraped {pages_scraped} pages, found {len(all_documents)} documents")
+            try:
+                # Load page with Selenium and extract content
+                self.driver.get(current_url)
+                
+                # Wait for page to load
+                wait = WebDriverWait(self.driver, 10)
+                wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                
+                # Additional wait for React content to render
+                time.sleep(3)
+                
+                # Get page source and parse with BeautifulSoup
+                page_source = self.driver.page_source
+                soup = BeautifulSoup(page_source, 'html.parser')
+                
+                # Extract content
+                documents = self.extract_content(soup, current_url)
+                self.visited_urls.add(current_url)
+                
+                # Add documents (with duplicate checking)
+                for doc in documents:
+                    is_duplicate = False
+                    for existing_doc in all_documents:
+                        # Check for duplicates based on content similarity
+                        if (len(doc.content.strip()) > 100 and
+                            doc.content.strip() == existing_doc.content.strip()):
+                            is_duplicate = True
+                            logger.debug(f"Skipping duplicate content from {doc.url}")
+                            break
+                    
+                    if not is_duplicate:
+                        all_documents.append(doc)
+                        logger.info(f"Added document: {doc.title} ({len(doc.content)} chars)")
+                
+                pages_scraped += 1
+                
+                # Find next page using Selenium
+                next_url = self.get_next_page_url(current_url)
+                
+                if next_url and next_url != current_url:
+                    current_url = next_url
+                    logger.info(f"Found next page: {next_url}")
+                else:
+                    logger.info("No more next pages found, scraping complete")
+                    break
+                
+                # Add delay to be respectful
+                time.sleep(2)
+                
+            except Exception as e:
+                logger.error(f"Error scraping {current_url}: {e}")
+                break
         
-        logger.info(f"Scraping complete. Total documents: {len(all_documents)}")
+        logger.info(f"Scraping complete. Total documents: {len(all_documents)} from {pages_scraped} pages")
         return all_documents
     
     def save_documents(self, documents: List[Document]):
@@ -291,7 +451,7 @@ def chunk_documents(documents: List[Document], chunk_size: int = 1000, overlap: 
     return chunks
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     
     scraper = JaqpotDocsScraper()
     documents = scraper.scrape_all(max_pages=30)

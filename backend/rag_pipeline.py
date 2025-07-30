@@ -5,12 +5,12 @@ from typing import List, Dict, Any
 import asyncio
 from dotenv import load_dotenv
 
-import pinecone
+import httpx
 from sentence_transformers import SentenceTransformer
-from langchain.llms import Ollama
+from langchain_community.llms import Ollama
 from langchain.prompts import PromptTemplate
 from langchain.chains import LLMChain
-import httpx
+from pinecone import Pinecone
 
 from document_processor import JaqpotDocsScraper, chunk_documents
 
@@ -22,6 +22,7 @@ class RAGPipeline:
     
     def __init__(self):
         self.embedding_model = None
+        self.pinecone_client = None
         self.pinecone_index = None
         self.llm = None
         self.qa_chain = None
@@ -30,15 +31,16 @@ class RAGPipeline:
         # Configuration
         self.index_name = "jaqpot-docs"
         self.embedding_dimension = 384  # all-MiniLM-L6-v2 dimension
-        self.data_dir = "../data/jaqpot_docs"
+        self.data_dir = "./data/jaqpot_docs" if os.path.exists("./data") else "../data/jaqpot_docs"
         
-        # Pinecone configuration
-        self.pinecone_host = os.getenv("PINECONE_HOST", "localhost:5080")
-        self.pinecone_api_key = os.getenv("PINECONE_API_KEY", "dummy-key")
+        # Pinecone configuration (online service)
+        self.pinecone_api_key = os.getenv("PINECONE_API_KEY")
+        if not self.pinecone_api_key:
+            logger.warning("PINECONE_API_KEY not found. Please create a .env file with your Pinecone API key.")
         
-        # Ollama configuration
-        self.ollama_host = os.getenv("OLLAMA_HOST", "localhost:11434")
-        self.ollama_model = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
+        # Ollama configuration (local service)
+        self.ollama_host = "localhost:11434"  # Standard local Ollama port
+        self.ollama_model = "llama3.1:8b"     # Standard model name
     
     async def initialize(self):
         """Initialize all components of the RAG pipeline"""
@@ -68,26 +70,35 @@ class RAGPipeline:
         """Initialize Pinecone client and index"""
         logger.info("Initializing Pinecone...")
         
+        if not self.pinecone_api_key:
+            logger.error("Cannot initialize Pinecone without API key. Please set PINECONE_API_KEY environment variable.")
+            raise ValueError("PINECONE_API_KEY is required")
+        
         try:
-            # Configure Pinecone for local instance
-            pinecone.init(
-                api_key=self.pinecone_api_key,
-                environment="local",
-                host=f"http://{self.pinecone_host}"
-            )
+            # Initialize Pinecone client
+            self.pinecone_client = Pinecone(api_key=self.pinecone_api_key)
             
             # Check if index exists, create if not
-            existing_indexes = pinecone.list_indexes()
+            existing_indexes = [index.name for index in self.pinecone_client.list_indexes()]
             
             if self.index_name not in existing_indexes:
                 logger.info(f"Creating index: {self.index_name}")
-                pinecone.create_index(
+                from pinecone import ServerlessSpec
+                
+                self.pinecone_client.create_index(
                     name=self.index_name,
                     dimension=self.embedding_dimension,
-                    metric="cosine"
+                    metric="cosine",
+                    spec=ServerlessSpec(
+                        cloud="aws",
+                        region="us-east-1"
+                    )
                 )
+                logger.info(f"Index {self.index_name} created successfully")
+            else:
+                logger.info(f"Index {self.index_name} already exists")
             
-            self.pinecone_index = pinecone.Index(self.index_name)
+            self.pinecone_index = self.pinecone_client.Index(self.index_name)
             logger.info("Pinecone initialized successfully")
             
         except Exception as e:
@@ -198,36 +209,77 @@ Answer:""",
         """Index document chunks in Pinecone"""
         logger.info(f"Indexing {len(chunks)} chunks...")
         
-        batch_size = 100
+        batch_size = 50  # Smaller batch size for better reliability
+        successful_uploads = 0
+        
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
+            total_batches = (len(chunks) + batch_size - 1) // batch_size
             
-            # Generate embeddings for batch
-            texts = [chunk["text"] for chunk in batch]
-            embeddings = self.embedding_model.encode(texts)
+            logger.info(f"Processing batch {batch_num}/{total_batches} ({len(batch)} chunks)")
             
-            # Prepare vectors for upload
-            vectors = []
-            for j, chunk in enumerate(batch):
-                vectors.append({
-                    "id": f"chunk_{chunk['chunk_id']}",
-                    "values": embeddings[j].tolist(),
-                    "metadata": {
-                        "text": chunk["text"][:1000],  # Truncate for metadata
-                        "title": chunk["title"],
-                        "url": chunk["url"],
-                        "section": chunk["section"],
-                        **chunk["metadata"]
+            try:
+                # Generate embeddings for batch
+                texts = [chunk["text"] for chunk in batch]
+                logger.info(f"Generating embeddings for batch of {len(texts)} texts...")
+                embeddings = self.embedding_model.encode(texts)
+                logger.info(f"Generated embeddings with shape: {embeddings.shape}")
+                
+                # Prepare vectors for upload
+                vectors = []
+                for j, chunk in enumerate(batch):
+                    # Ensure metadata is JSON serializable
+                    metadata = {
+                        "text": str(chunk["text"])[:1000],  # Truncate for metadata
+                        "title": str(chunk["title"]),
+                        "url": str(chunk["url"]),
+                        "section": str(chunk["section"])
                     }
-                })
+                    
+                    # Add other metadata safely
+                    if "metadata" in chunk and chunk["metadata"]:
+                        for key, value in chunk["metadata"].items():
+                            if isinstance(value, (str, int, float, bool)):
+                                metadata[key] = value
+                    
+                    vectors.append({
+                        "id": f"chunk_{chunk['chunk_id']}",
+                        "values": embeddings[j].tolist(),
+                        "metadata": metadata
+                    })
+                
+                logger.info(f"Prepared {len(vectors)} vectors for upload...")
+                
+                # Upload to Pinecone with retry logic
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        result = self.pinecone_index.upsert(vectors=vectors)
+                        logger.info(f"Batch {batch_num} upsert result: {result}")
+                        successful_uploads += result.get('upserted_count', len(vectors))
+                        break
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"Attempt {attempt + 1} failed for batch {batch_num}: {e}. Retrying...")
+                            await asyncio.sleep(1)  # Wait before retry
+                        else:
+                            logger.error(f"Failed to upsert batch {batch_num} after {max_retries} attempts: {e}")
+                            raise e
+                
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_num}: {e}")
+                # Continue with next batch instead of failing completely
+                continue
             
-            # Upload to Pinecone
-            self.pinecone_index.upsert(vectors=vectors)
-            
-            if (i + batch_size) % 500 == 0:
-                logger.info(f"Indexed {min(i + batch_size, len(chunks))}/{len(chunks)} chunks")
+            # Add small delay between batches to avoid rate limiting
+            await asyncio.sleep(0.5)
         
-        logger.info("Indexing complete")
+        logger.info(f"Indexing complete. Successfully uploaded {successful_uploads} vectors.")
+        
+        # Verify final count
+        final_stats = self.pinecone_index.describe_index_stats()
+        logger.info(f"Final index stats: {final_stats}")
     
     async def query(self, question: str, max_results: int = 5) -> Dict[str, Any]:
         """Query the RAG system"""
