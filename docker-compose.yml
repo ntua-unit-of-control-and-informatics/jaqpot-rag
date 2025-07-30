@@ -1,0 +1,42 @@
+services:
+  # Pinecone Local Vector Database
+  pinecone-local:
+    image: ghcr.io/pinecone-io/pinecone-local:latest
+    container_name: pinecone-local
+    ports:
+      - "5080:5080"
+    environment:
+      - PINECONE_API_KEY=dummy-key
+      - PINECONE_ENVIRONMENT=local
+    volumes:
+      - pinecone_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Ollama for Local LLM
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_ORIGINS=*
+    command: >
+      bash -c "ollama serve & 
+      sleep 10 && 
+      ollama pull llama3.1:8b && 
+      wait"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+volumes:
+  pinecone_data:
+  ollama_data:
